@@ -1,8 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use indy_credx::{
     issuer, prover,
-    types::{CredentialDefinitionConfig, MakeCredentialValues, PresentCredentials, SignatureType},
+    tails::{TailsFileReader, TailsFileWriter},
+    types::{
+        Credential, CredentialDefinitionConfig, CredentialRevocationConfig, IssuanceType,
+        MakeCredentialValues, PresentCredentials, RegistryType, RevocationRegistryDefinition,
+        SignatureType,
+    },
     verifier,
 };
 
@@ -208,6 +213,370 @@ fn anoncreds_works_for_single_issuer_single_prover() {
         None,
     )
     .expect("Error verifying presentation");
+    assert!(valid);
+}
+
+#[test]
+fn anoncreds_works_for_manipulated_revocable() {
+    // Create Issuer pseudo wallet
+    let mut issuer_wallet = IssuerWallet::default();
+
+    // Create Prover pseudo wallet and master secret
+    let mut prover_wallet = ProverWallet::default();
+
+    // Issuer creates Schema - would be published to the ledger
+    let gvt_schema = issuer::create_schema(
+        &issuer_wallet.did,
+        GVT_SCHEMA_NAME,
+        "1.0",
+        GVT_SCHEMA_ATTRIBUTES[..].into(),
+        None,
+    )
+    .expect("Error creating gvt schema for issuer");
+
+    // Issuer creates Credential Definition
+    let cred_def_parts = issuer::create_credential_definition(
+        &issuer_wallet.did,
+        &gvt_schema,
+        "tag",
+        SignatureType::CL,
+        CredentialDefinitionConfig {
+            support_revocation: true,
+        },
+    )
+    .expect("Error creating gvt credential definition");
+    issuer_wallet.cred_defs.push(cred_def_parts.into());
+
+    // Public part would be published to the ledger
+    let gvt_cred_def = &issuer_wallet.cred_defs[0].public;
+
+    let mut tails_writer = TailsFileWriter::new(None);
+    let (rev_reg_def, rev_reg_def_private, mut rev_reg, _) = issuer::create_revocation_registry(
+        &issuer_wallet.did,
+        &gvt_cred_def,
+        "tag",
+        RegistryType::CL_ACCUM,
+        IssuanceType::ISSUANCE_BY_DEFAULT,
+        100,
+        &mut tails_writer,
+    )
+    .expect("Error creating gvt revocation registry");
+    drop(tails_writer);
+    let tails_location = match &rev_reg_def {
+        RevocationRegistryDefinition::RevocationRegistryDefinitionV1(r) => {
+            r.value.tails_location.to_string()
+        }
+    };
+    // Represents the revoked indices when using ISSUANCE_BY_DEFAULT
+    let mut registry_used = HashSet::new();
+
+    // Issuer creates a Credential Offer
+    let cred_offer_1 = issuer::create_credential_offer(
+        gvt_schema.id(),
+        &gvt_cred_def,
+        &issuer_wallet.cred_defs[0].key_proof,
+    )
+    .expect("Error creating credential offer");
+
+    // Prover creates a Credential Request
+    let (cred_request_1, cred_request_metadata_1) = prover::create_credential_request(
+        &prover_wallet.did,
+        &*gvt_cred_def,
+        &prover_wallet.master_secret,
+        "default",
+        &cred_offer_1,
+    )
+    .expect("Error creating credential request");
+
+    // Issuer creates a credential for 'Alex'
+    let mut cred_values = MakeCredentialValues::default();
+    cred_values
+        .add_raw("sex", "male")
+        .expect("Error encoding attribute");
+    cred_values
+        .add_raw("name", "Alex")
+        .expect("Error encoding attribute");
+    cred_values
+        .add_raw("height", "175")
+        .expect("Error encoding attribute");
+    cred_values
+        .add_raw("age", "28")
+        .expect("Error encoding attribute");
+
+    let tails_reader = TailsFileReader::new(&tails_location);
+    let (issue_cred, rev_reg_1, _) = issuer::create_credential(
+        &*gvt_cred_def,
+        &issuer_wallet.cred_defs[0].private,
+        &cred_offer_1,
+        &cred_request_1,
+        cred_values.into(),
+        Some(CredentialRevocationConfig {
+            reg_def: &rev_reg_def,
+            reg_def_private: &rev_reg_def_private,
+            registry: &rev_reg,
+            registry_used: &registry_used,
+            registry_idx: 1,
+            tails_reader,
+        }),
+    )
+    .expect("Error creating credential");
+    rev_reg = rev_reg_1.expect("No registry state returned");
+
+    // Prover receives the credential and processes it
+    let mut recv_cred = issue_cred;
+    prover::process_credential(
+        &mut recv_cred,
+        &cred_request_metadata_1,
+        &prover_wallet.master_secret,
+        &*gvt_cred_def,
+        Some(&rev_reg_def),
+    )
+    .expect("Error processing credential");
+    prover_wallet.credentials.push(recv_cred);
+
+    // Issuer creates a second Credential Offer
+    let cred_offer_2 = issuer::create_credential_offer(
+        gvt_schema.id(),
+        &gvt_cred_def,
+        &issuer_wallet.cred_defs[0].key_proof,
+    )
+    .expect("Error creating credential offer");
+
+    // Prover creates a second Credential Request
+    let (cred_request_2, cred_request_metadata_2) = prover::create_credential_request(
+        &prover_wallet.did,
+        &*gvt_cred_def,
+        &prover_wallet.master_secret,
+        "default",
+        &cred_offer_2,
+    )
+    .expect("Error creating credential request");
+
+    // Issuer creates a second credential for 'Alexa'
+    let mut cred_values = MakeCredentialValues::default();
+    cred_values
+        .add_raw("sex", "female")
+        .expect("Error encoding attribute");
+    cred_values
+        .add_raw("name", "Alexa")
+        .expect("Error encoding attribute");
+    cred_values
+        .add_raw("height", "185")
+        .expect("Error encoding attribute");
+    cred_values
+        .add_raw("age", "42")
+        .expect("Error encoding attribute");
+
+    let tails_reader = TailsFileReader::new(&tails_location);
+    let (issue_cred, rev_reg_2, _) = issuer::create_credential(
+        &*gvt_cred_def,
+        &issuer_wallet.cred_defs[0].private,
+        &cred_offer_2,
+        &cred_request_2,
+        cred_values.into(),
+        Some(CredentialRevocationConfig {
+            reg_def: &rev_reg_def,
+            reg_def_private: &rev_reg_def_private,
+            registry: &rev_reg,
+            registry_used: &registry_used,
+            registry_idx: 2,
+            tails_reader,
+        }),
+    )
+    .expect("Error creating credential");
+    rev_reg = rev_reg_2.expect("No registry state returned");
+
+    // Prover receives the second credential and processes it
+    let mut recv_cred = issue_cred;
+    prover::process_credential(
+        &mut recv_cred,
+        &cred_request_metadata_2,
+        &prover_wallet.master_secret,
+        &*gvt_cred_def,
+        Some(&rev_reg_def),
+    )
+    .expect("Error processing credential");
+    prover_wallet.credentials.push(recv_cred);
+
+    // Revoke first credential
+    let rev_ts = 10000;
+    let tails_reader = TailsFileReader::new(&tails_location);
+    let (rev_reg_3, rev_reg_delta) =
+        issuer::revoke_credential(&rev_reg_def, &rev_reg, 1, &tails_reader)
+            .expect("Error revoking credential");
+    rev_reg = rev_reg_3;
+    registry_used.insert(1);
+
+    // Verifier creates a presentation request
+    let nonce = verifier::generate_nonce().expect("Error generating presentation request nonce");
+    let pres_request = serde_json::from_value(json!({
+        "nonce": nonce,
+        "name":"pres_req_1",
+        "version":"0.1",
+        "requested_attributes":{
+            "attr1_referent":{
+                "name":"name",
+            },
+            "attr2_referent":{
+                "name":"sex"
+            },
+        },
+        "requested_predicates":{
+            "predicate1_referent":{"name":"age","p_type":">=","p_value":18}
+        },
+        "non_revoked": {"to":rev_ts+1},
+    }))
+    .expect("Error creating proof request");
+
+    // ### Prover creates failing presentation for revoked credential 1 ###
+
+    // Create revocation state for index 1
+    let tails_reader = TailsFileReader::new(&tails_location);
+    let rev_state = prover::create_or_update_revocation_state(
+        tails_reader,
+        &rev_reg_def,
+        &rev_reg_delta,
+        1,
+        rev_ts,
+        None,
+    )
+    .expect("Error creating revocation state");
+
+    let mut present = PresentCredentials::default();
+    {
+        let mut cred1 = present.add_credential(
+            &prover_wallet.credentials[0],
+            Some(rev_ts),
+            Some(&rev_state),
+        );
+        cred1.add_requested_attribute("attr1_referent", true);
+        cred1.add_requested_attribute("attr2_referent", false);
+        cred1.add_requested_predicate("predicate1_referent");
+    }
+
+    let mut schemas = HashMap::new();
+    schemas.insert(gvt_schema.id().clone(), &gvt_schema);
+
+    let mut cred_defs = HashMap::new();
+    cred_defs.insert(gvt_cred_def.id().clone(), &*gvt_cred_def);
+
+    let mut rev_reg_defs = HashMap::new();
+    rev_reg_defs.insert(rev_reg_def.id().clone(), &rev_reg_def);
+
+    let mut rev_regs = HashMap::new();
+    let mut rev_reg_ins = HashMap::new();
+    rev_reg_ins.insert(rev_ts, &rev_reg);
+    rev_regs.insert(rev_reg_def.id().clone(), rev_reg_ins);
+
+    let presentation = prover::create_presentation(
+        &pres_request,
+        present,
+        None,
+        &prover_wallet.master_secret,
+        &schemas,
+        &cred_defs,
+    )
+    .expect("Error creating presentation");
+
+    let valid = verifier::verify_presentation(
+        &presentation,
+        &pres_request,
+        &schemas,
+        &cred_defs,
+        Some(&rev_reg_defs),
+        Some(&rev_regs),
+    )
+    .expect("Error verifying presentation");
+    // Should fail due to revocation status
+    assert!(!valid);
+
+    let mut fake_cred_json =
+        serde_json::to_value(&prover_wallet.credentials[0]).expect("Error serializing credential");
+    let orig_cred2: serde_json::Value =
+        serde_json::to_value(&prover_wallet.credentials[1]).expect("Error serializing credential");
+
+    // Copy revocation info from credential 2 to credential 1
+    fake_cred_json["signature"]["r_credential"] = orig_cred2["signature"]["r_credential"].clone();
+    fake_cred_json["witness"] = orig_cred2["witness"].clone();
+
+    let fake_cred: Credential =
+        serde_json::from_value(fake_cred_json).expect("Error deserializing credential");
+
+    // ### Prover creates a presentation for the manipulated credential ### //
+
+    // Create revocation state for index 2
+    let tails_reader = TailsFileReader::new(&tails_location);
+    let rev_state = prover::create_or_update_revocation_state(
+        tails_reader,
+        &rev_reg_def,
+        &rev_reg_delta,
+        2,
+        rev_ts,
+        None,
+    )
+    .expect("Error creating revocation state");
+
+    let mut present = PresentCredentials::default();
+    {
+        let mut cred1 = present.add_credential(&fake_cred, Some(rev_ts), Some(&rev_state));
+        cred1.add_requested_attribute("attr1_referent", true);
+        cred1.add_requested_attribute("attr2_referent", false);
+        cred1.add_requested_predicate("predicate1_referent");
+    }
+
+    let mut schemas = HashMap::new();
+    schemas.insert(gvt_schema.id().clone(), &gvt_schema);
+
+    let mut cred_defs = HashMap::new();
+    cred_defs.insert(gvt_cred_def.id().clone(), &*gvt_cred_def);
+
+    let mut rev_reg_defs = HashMap::new();
+    rev_reg_defs.insert(rev_reg_def.id().clone(), &rev_reg_def);
+
+    let mut rev_regs = HashMap::new();
+    let mut rev_reg_ins = HashMap::new();
+    rev_reg_ins.insert(rev_ts, &rev_reg);
+    rev_regs.insert(rev_reg_def.id().clone(), rev_reg_ins);
+
+    let presentation = prover::create_presentation(
+        &pres_request,
+        present,
+        None,
+        &prover_wallet.master_secret,
+        &schemas,
+        &cred_defs,
+    )
+    .expect("Error creating presentation");
+
+    // Verifier verifies presentation
+    assert_eq!(
+        "Alex",
+        presentation
+            .requested_proof
+            .revealed_attrs
+            .get("attr1_referent")
+            .unwrap()
+            .raw
+    );
+    assert_eq!(
+        0,
+        presentation
+            .requested_proof
+            .unrevealed_attrs
+            .get("attr2_referent")
+            .unwrap()
+            .sub_proof_index
+    );
+    let valid = verifier::verify_presentation(
+        &presentation,
+        &pres_request,
+        &schemas,
+        &cred_defs,
+        Some(&rev_reg_defs),
+        Some(&rev_regs),
+    )
+    .expect("Error verifying presentation");
+    // Uh-oh
     assert!(valid);
 }
 
